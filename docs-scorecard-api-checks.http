@@ -1,0 +1,54 @@
+-- 赛事记分卡签核闭环 · 端到端手工验证脚本（按顺序执行；HTTP 状态码与消息均有断言点）
+-- 前置：./start.sh 起服务；赛事 1「金秋会员邀请赛」种子状态为「报名中」，先推进为「进行中」。
+
+-- 0) 赛事开始
+-- POST /api/tournaments/1/advance?target=进行中
+
+-- ===== A. 记分员：草稿与提交校验 =====
+-- A1. 刘振华(id=5) 草稿 7 洞齐全（种子卡1, version=0），先拿详情
+GET /api/scorecards/1
+-- A2. 缺洞/报名中赛事提交拦截：林浩(id=1) 卡2 只录了 5 洞
+--   预期 400：「记分卡不满足提交条件：第 7 洞…尚未录入杆数；第 8 洞…尚未录入杆数」
+POST /api/scorecards/2/submit  {"submitter":"记分员小周","expectedVersion":0}
+-- A3. 卡1 合法提交 → 200，status=待球员确认, version=1, snapshotJson 已固化
+POST /api/scorecards/1/submit  {"submitter":"记分员小周","expectedVersion":0}
+-- A4. 固化后普通编辑被拒 → 400：「记分卡已提交（当前：待球员确认），快照已固化…」
+POST /api/scorecards/1/holes   {"holeNo":1,"strokes":9,"expectedVersion":1}
+-- A5. 重复提交被拒 → 400
+POST /api/scorecards/1/submit  {"submitter":"记分员小周","expectedVersion":1}
+
+-- ===== B. 乐观并发：两人同时确认/裁决同一张卡，只允许一次成功 =====
+-- 两个页面都持有卡3(王启明) v1：
+POST /api/scorecards/3/confirm {"playerName":"王启明","expectedVersion":1}  -- 200 → 已签核 v2
+POST /api/scorecards/3/confirm {"playerName":"王启明","expectedVersion":1}  -- 409 数据已变化(v2)
+-- 已签核不可撤回：再次确认 → 400「签核为终态，不能撤回或重复确认」
+
+-- ===== C. 球员：按洞争议；非本人被拒 =====
+-- 卡4(陈雨桐) 种子为争议中；先让裁判改判后球员再确认，或直接看裁判流。
+-- 归属校验：用别人的名字 → 400「球员只能处理本人的记分卡…」
+
+-- ===== D. 裁判：只处理争议中；维持/修正后发回 =====
+GET /api/scorecards/disputed?tournamentId=1            -- 仅含卡4
+-- 修正第2洞 6→5，必须写裁决说明：
+POST /api/scorecards/4/rule {"referee":"裁判长老","expectedVersion":2,"rulings":[
+  {"holeNo":2,"ruledStrokes":5,"note":"调取同组记分与球童记录，认定为5杆，原6杆系笔误"}]}
+-- 预期 200：status=待球员确认, version=3, totalStrokes=32，事件新增「修正」
+-- 并发过期裁决 → 409；非争议洞裁决 → 400；缺裁决说明 → 400
+-- 球员对 v3 再确认 → 已签核 v4：
+POST /api/scorecards/4/confirm {"playerName":"陈雨桐","expectedVersion":3}
+
+-- ===== E. 留痕 =====
+GET /api/scorecards/4/events
+-- 提交(v0→v1) / 争议(v1→v2) / 修正(v2→v3) / 确认(v3→v4)，每条含 before_json/after_json
+
+-- ===== F. 正式排行榜：争议/待确认/草稿不出现，历史版本不重复 =====
+GET /api/scorecards/official?tournamentId=1
+-- 仅含 status=已签核 的卡；卡3、卡4 签核后出现，各只计一次（当前快照）
+
+-- ===== G. 赛事收口闸门 =====
+-- 赛事1 有 4 名参赛球员：林浩(卡2 草稿) 等仍未签核时：
+GET /api/scorecards/signoff-check?tournamentId=1
+-- canClose=false，blockingReasons 逐条列出（草稿/待确认/争议/缺卡）
+POST /api/tournaments/1/advance?target=已结束
+-- 400：「赛事不能收口：仍有 N 条未签核记录——…」
+-- 把所有参赛球员每轮卡都签核后 → canClose=true，推进成功。
