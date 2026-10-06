@@ -51,7 +51,17 @@ export default {
   getTournament: (id) => call(http.get(`/tournaments/${id}`)),
   createTournament: (d) => call(http.post('/tournaments', d)),
   updateTournament: (id, d) => call(http.put(`/tournaments/${id}`, d)),
-  advanceTournament: (id, target) => call(http.post(`/tournaments/${id}/advance`, null, params({ target }))),
+  advanceTournament: (id, target, expectedVersion) =>
+    call(http.post(`/tournaments/${id}/advance`, null,
+      params({ target, ...(expectedVersion != null ? { expectedVersion } : {}) }))),
+
+  // ---------------- 赛事排行榜快照（临时结果 / 正式快照 / 收口失败原因） ----------------
+  // 同一接口按赛事状态返回不同口径：报名中/进行中=临时结果；已结束=冻结正式快照；
+  // 收口失败=失败原因+当前临时排名；修复前旧赛事=只读历史口径。
+  getTournamentLeaderboard: (id) => call(http.get(`/tournaments/${id}/leaderboard`)),
+  finalizeTournamentLeaderboard: (id, expectedVersion) =>
+    call(http.post(`/tournaments/${id}/leaderboard/finalize`, null,
+      params({ ...(expectedVersion != null ? { expectedVersion } : {}) }))),
 
   // ---------------- 排行榜（乐观锁演示） ----------------
   listLeaderboards: (p) => call(http.get('/leaderboards', params(p || {}))),

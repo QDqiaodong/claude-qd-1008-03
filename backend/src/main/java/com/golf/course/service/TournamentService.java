@@ -7,27 +7,29 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.golf.course.common.BizException;
+import com.golf.course.common.ConflictException;
 import com.golf.course.common.Dict;
-import com.golf.course.dto.SignoffCheck;
+import com.golf.course.dto.LeaderboardView;
 import com.golf.course.entity.Tournament;
 import com.golf.course.repository.TournamentRepository;
 
 /**
  * 赛事业务。核心规则：状态只能逐级推进：报名中 → 进行中 → 已结束。
  *
- * <p>推进到「已结束」前必须通过记分卡签核检查：全部参赛球员的每一轮记分卡均已签核；
- * 任何草稿 / 待确认 / 争议中 / 缺卡都会阻止收口，并把逐条原因返回给页面。</p>
+ * <p>推进到「已结束」不再只是改一个状态标记：收口必须在同一事务里通过排行榜快照服务完成
+ * 「确认全部参赛成绩 → 校验（缺成绩 / 孤儿球员 / 洞号杆数不合法）→ 冻结唯一正式快照 → 翻状态」。
+ * 任何一步失败整体回滚，赛事保持「进行中」，只留下失败原因留痕，绝不产生半份正式结果。</p>
  */
 @Service
 public class TournamentService {
 
     private final TournamentRepository tournamentRepository;
-    private final ScorecardService scorecardService;
+    private final LeaderboardSnapshotService leaderboardSnapshotService;
 
     public TournamentService(TournamentRepository tournamentRepository,
-                             ScorecardService scorecardService) {
+                             LeaderboardSnapshotService leaderboardSnapshotService) {
         this.tournamentRepository = tournamentRepository;
-        this.scorecardService = scorecardService;
+        this.leaderboardSnapshotService = leaderboardSnapshotService;
     }
 
     public List<Tournament> list() {
@@ -116,8 +118,15 @@ public class TournamentService {
         }
     }
 
-    @Transactional
-    public Tournament advance(Long id, String target) {
+    /**
+     * 状态推进。推进到「已结束」时委托排行榜快照服务收口：
+     * 在悲观行锁 + 乐观版本双保护下校验全部参赛成绩、冻结唯一正式快照并翻状态；
+     * 校验失败整体回滚（不产生半份正式结果），失败原因精确到赛事 / 球员 / 洞号。
+     *
+     * @param expectedVersion 页面看到的赛事版本号；多人同时收口时过期一方收到 409
+     * @return 收口成功时为冻结的正式排行榜视图；其余推进返回 null（控制器回读赛事实体）
+     */
+    public LeaderboardView advance(Long id, String target, Long expectedVersion) {
         Tournament t = get(id);
         if (!Dict.isValidTournamentStatus(target)) {
             throw new BizException("赛事状态不合法：" + target);
@@ -126,13 +135,21 @@ public class TournamentService {
             throw new BizException("不允许从「" + t.getStatus() + "」直接转为「" + target + "」");
         }
         if ("已结束".equals(target)) {
-            SignoffCheck check = scorecardService.signoffCheck(id);
-            if (!check.canClose()) {
-                throw new BizException("赛事不能收口：仍有 " + check.blockingReasons().size()
-                        + " 条未签核记录——" + String.join("；", check.blockingReasons()));
+            if (expectedVersion != null && !expectedVersion.equals(t.getVersion())) {
+                throw new ConflictException("赛事数据已变化：你打开的是 v" + expectedVersion
+                        + "，当前已是 v" + t.getVersion()
+                        + "。本次收口未生效，请重新读取当前排行榜与赛事状态后再操作");
             }
+            // finalizeOfficial 自行编排独立事务（校验失败要先回滚再用新事务留痕），
+            // 本方法不加外层事务，避免内层 TransactionTemplate 被迫加入外层事务而失去回滚边界。
+            return leaderboardSnapshotService.finalizeOfficial(id, expectedVersion);
+        }
+        if (expectedVersion != null && !expectedVersion.equals(t.getVersion())) {
+            throw new ConflictException("赛事数据已变化：你打开的是 v" + expectedVersion
+                    + "，当前已是 v" + t.getVersion() + "。本次操作未生效，请刷新后重试");
         }
         t.setStatus(target);
-        return tournamentRepository.save(t);
+        tournamentRepository.save(t);
+        return null;
     }
 }

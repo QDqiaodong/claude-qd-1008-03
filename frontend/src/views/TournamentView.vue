@@ -1,12 +1,12 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import api from '../api'
 
 const tournaments = ref([])
 const players = ref([])
 const holes = ref([])
 
-const leaderboards = ref([])
+const leaderboard = ref(null)
 const scores = ref([])
 const error = ref('')
 const tip = ref('')
@@ -49,14 +49,6 @@ async function saveEdit() {
   } catch (e) { error.value = e.message } finally { savingEdit.value = false }
 }
 
-// ---- 排行榜 ----
-const lbDialog = ref(false)
-const savingLb = ref(false)
-const lbForm = ref(blankLb())
-function blankLb() {
-  return { tournamentId: null, roundNo: 1, leaderName: '', totalScore: null }
-}
-
 // ---- 成绩 ----
 const scoreDialog = ref(false)
 const savingScore = ref(false)
@@ -67,6 +59,7 @@ function blankScore() {
 
 const canStart = (t) => t && t.status === '报名中'
 const canEnd = (t) => t && t.status === '进行中'
+const selectedTour = computed(() => tournaments.value.find(t => t.id === selectedTourId.value) || null)
 
 async function loadTournaments() {
   tournaments.value = (await api.listTournaments()) || []
@@ -74,9 +67,10 @@ async function loadTournaments() {
     selectedTourId.value = tournaments.value[0].id
   }
 }
-async function loadLeaderboards() {
-  if (!selectedTourId.value) { leaderboards.value = []; return }
-  leaderboards.value = (await api.listLeaderboards({ tournamentId: selectedTourId.value })) || []
+async function loadLeaderboard() {
+  if (!selectedTourId.value) { leaderboard.value = null; return }
+  // 不覆盖面板的失败提示：临时/失败视图是正常 200 返回，直接替换；请求异常时保留旧面板
+  leaderboard.value = (await api.getTournamentLeaderboard(selectedTourId.value)) || null
 }
 async function loadScores() {
   if (!selectedTourId.value) { scores.value = []; return }
@@ -85,7 +79,7 @@ async function loadScores() {
 
 async function loadAll() {
   await Promise.all([loadTournaments(), loadPlayers(), loadHoles()])
-  await Promise.all([loadLeaderboards(), loadScores()])
+  await Promise.all([loadLeaderboard(), loadScores()])
 }
 async function loadPlayers() { players.value = (await api.listPlayers()) || [] }
 async function loadHoles() { holes.value = (await api.listHoles()) || [] }
@@ -104,30 +98,56 @@ async function saveTour() {
     tourDialog.value = false; await loadTournaments()
   } catch (e) { error.value = e.message } finally { savingTour.value = false }
 }
+
+/**
+ * 推进赛事。开始（报名中 → 进行中）只翻状态；结束（进行中 → 已结束）即收口：
+ * 后端在同一事务校验全部参赛成绩、冻结唯一正式快照。409（并发 / 版本过期）与 400
+ * （收口校验失败）都会提示并按当前状态重新读取排行榜。
+ */
 async function advance(t, target) {
   error.value = ''; tip.value = ''
-  try { await api.advanceTournament(t.id, target); tip.value = `赛事已推进至「${target}」`; await loadTournaments() }
-  catch (e) { error.value = e.message }
+  const version = t.version
+  try {
+    await api.advanceTournament(t.id, target, version)
+    tip.value = target === '已结束'
+      ? '赛事已收口：正式排行榜快照已生成并冻结，之后补录 / 修改 / 删除成绩都不会再改变名次'
+      : `赛事已推进至「${target}」`
+    await loadTournaments()
+    await Promise.all([loadLeaderboard(), loadScores()])
+  } catch (e) {
+    error.value = e.isConflict
+      ? `${e.message}（并发冲突，页面已按当前状态刷新）`
+      : e.message
+    await loadTournaments()
+    // 收口失败时后端会留下「生成失败」原因，读取排行榜即可展示具体赛事 / 球员 / 洞号
+    await loadLeaderboard().catch(() => {})
+  }
 }
 
-function openLb() {
-  lbForm.value = blankLb(); lbForm.value.tournamentId = selectedTourId.value
-  lbDialog.value = true; error.value = ''; tip.value = ''
-}
-async function saveLb() {
-  savingLb.value = true; error.value = ''
+/** 显式「收口并生成正式排名」按钮，与推进到已结束同一路径。 */
+const finalizing = ref(false)
+async function finalizeLeaderboard() {
+  if (!selectedTour.value) return
+  finalizing.value = true; error.value = ''; tip.value = ''
   try {
-    await api.createLeaderboard({ ...lbForm.value, roundNo: Number(lbForm.value.roundNo), totalScore: Number(lbForm.value.totalScore) })
-    tip.value = '排行榜已创建'; lbDialog.value = false; await loadLeaderboards()
-  } catch (e) { error.value = e.message } finally { savingLb.value = false }
+    await api.finalizeTournamentLeaderboard(selectedTour.value.id, selectedTour.value.version)
+    tip.value = '正式排行榜快照已生成并冻结，后续刷新只返回这份名次'
+    await loadTournaments()
+    await Promise.all([loadLeaderboard(), loadScores()])
+  } catch (e) {
+    error.value = e.isConflict ? `${e.message}（并发冲突）` : e.message
+    await loadTournaments()
+    await loadLeaderboard().catch(() => {})
+  } finally { finalizing.value = false }
 }
-async function lockAndRead(lb) {
-  error.value = ''; tip.value = ''
-  try {
-    const updated = await api.lockAndReadLeaderboard(lb.id)
-    tip.value = `已锁定并读取：版本号由 ${lb.version} → ${updated.version}（OPTIMISTIC_FORCE_INCREMENT）`
-    await loadLeaderboards()
-  } catch (e) { error.value = e.message }
+
+/** 刷新排行榜：临时结果按当前成绩重算；正式快照只返回冻结体（名次不随后续成绩变化）。 */
+const refreshingLb = ref(false)
+async function refreshLeaderboard() {
+  refreshingLb.value = true
+  try { await loadLeaderboard(); tip.value = '排行榜已刷新' }
+  catch (e) { error.value = e.message }
+  finally { refreshingLb.value = false }
 }
 
 function openScore() {
@@ -144,16 +164,44 @@ async function saveScore() {
       roundNo: Number(scoreForm.value.roundNo),
       strokes: Number(scoreForm.value.strokes)
     })
-    tip.value = '成绩已录入（相对标准杆见 toPar 列）'
-    scoreDialog.value = false; await loadScores()
+    tip.value = '成绩已录入（相对标准杆见 toPar 列），临时排名已随之更新'
+    scoreDialog.value = false
+    await Promise.all([loadScores(), loadLeaderboard()])
   } catch (e) { error.value = e.message } finally { savingScore.value = false }
 }
 
 const toParText = (s) => s.toPar == null ? '-' : (s.toPar === 0 ? 'E' : (s.toPar > 0 ? '+' + s.toPar : s.toPar))
+const toParRowText = (row) => (row.toPar == null ? '—' : (row.toPar === 0 ? 'E' : (row.toPar > 0 ? '+' + row.toPar : row.toPar)))
+const lbTagType = (lb) => !lb ? 'info'
+  : lb.kind === '正式快照' ? 'success'
+  : lb.kind === '生成失败' ? 'danger'
+  : lb.kind === '历史口径' ? 'info'
+  : 'warning'
+const lbTagText = (lb) => lb ? lb.kind : ''
 
-watch(selectedTourId, async () => { await Promise.all([loadLeaderboards(), loadScores()]) })
+// 自动刷新：只要选中赛事还在报名中 / 进行中，每 10 秒重读排行榜（临时结果随成绩变化）；
+// 已结束后冻结体不会变化，停止轮询，避免无意义请求。
+let timer = null
+function syncAutoRefresh() {
+  if (timer) { clearInterval(timer); timer = null }
+  const t = selectedTour.value
+  if (t && t.status !== '已结束' && activeTab.value === 'leaderboard') {
+    timer = setInterval(() => { loadLeaderboard().catch(() => {}) }, 10000)
+  }
+}
 
-onMounted(loadAll)
+watch(selectedTourId, async () => {
+  await Promise.all([loadLeaderboard(), loadScores()])
+  syncAutoRefresh()
+})
+watch(() => selectedTour.value?.status, syncAutoRefresh)
+watch(activeTab, syncAutoRefresh)
+
+onMounted(async () => {
+  await loadAll()
+  syncAutoRefresh()
+})
+onUnmounted(() => { if (timer) clearInterval(timer) })
 </script>
 
 <template>
@@ -170,7 +218,7 @@ onMounted(loadAll)
             <span class="panel-desc">状态只能逐级推进：报名中 → 进行中 → 已结束</span>
           </div>
           <div class="toolbar">
-            <el-select v-model="selectedTourId" placeholder="选择赛事" style="width: 220px" @change="loadLeaderboards">
+            <el-select v-model="selectedTourId" placeholder="选择赛事" style="width: 220px">
               <el-option v-for="t in tournaments" :key="t.id" :label="`${t.name}（${t.status}）`" :value="t.id" />
             </el-select>
             <span class="spacer"></span>
@@ -204,33 +252,117 @@ onMounted(loadAll)
         </div>
       </el-tab-pane>
 
-      <!-- ============ 排行榜（乐观锁演示） ============ -->
+      <!-- ============ 排行榜（临时结果 / 正式快照 / 收口失败） ============ -->
       <el-tab-pane label="排行榜" name="leaderboard">
         <div class="panel">
           <div class="panel-head">
-            <span class="panel-title">赛事排行榜 · 乐观锁演示</span>
-            <span class="panel-desc">「锁定并读取」用 OPTIMISTIC_FORCE_INCREMENT 强制版本号 +1，并发刷新会触发版本冲突</span>
+            <span class="panel-title">赛事排行榜 · 收口快照</span>
+            <span class="panel-desc">报名中 / 进行中只显示临时结果；收口到已结束时冻结唯一正式快照，之后刷新永远是这份名次</span>
           </div>
           <div class="toolbar">
-            <el-select v-model="selectedTourId" placeholder="选择赛事" style="width: 220px">
-              <el-option v-for="t in tournaments" :key="t.id" :label="t.name" :value="t.id" />
+            <el-select v-model="selectedTourId" placeholder="选择赛事" style="width: 260px">
+              <el-option v-for="t in tournaments" :key="t.id" :label="`${t.name}（${t.status}）`" :value="t.id" />
             </el-select>
+            <el-tag :type="selectedTour ? (selectedTour.status === '已结束' ? 'success' : selectedTour.status === '进行中' ? 'warning' : 'info') : 'info'">
+              赛事状态：{{ selectedTour?.status || '—' }}
+            </el-tag>
             <span class="spacer"></span>
-            <el-button type="primary" @click="openLb">新增排行</el-button>
+            <el-button :loading="refreshingLb" @click="refreshLeaderboard">刷新排行榜</el-button>
+            <el-button type="success" :disabled="!canEnd(selectedTour)" :loading="finalizing"
+                       @click="finalizeLeaderboard">收口并生成正式排名</el-button>
           </div>
-          <el-table :data="leaderboards" border stripe>
-            <el-table-column prop="roundNo" label="轮次" width="90" />
-            <el-table-column prop="leaderName" label="领先球员" min-width="130" />
-            <el-table-column prop="totalScore" label="总杆" width="100" />
-            <el-table-column prop="version" label="版本号" width="100">
-              <template #default="{ row }"><el-tag type="primary">{{ row.version }}</el-tag></template>
-            </el-table-column>
-            <el-table-column label="操作" width="140" fixed="right">
-              <template #default="{ row }">
-                <el-button size="small" type="primary" plain @click="lockAndRead(row)">锁定并读取</el-button>
+
+          <template v-if="leaderboard">
+            <!-- 口径总览 -->
+            <el-alert
+              :type="leaderboard.kind === '正式快照' ? 'success'
+                : leaderboard.kind === '生成失败' ? 'error'
+                : leaderboard.kind === '历史口径' ? 'info' : 'warning'"
+              :closable="false" show-icon class="lb-banner">
+              <template #title>
+                <div class="lb-banner-title">
+                  <el-tag :type="lbTagType(leaderboard)" size="small" effect="dark">{{ lbTagText(leaderboard) }}</el-tag>
+                  <span v-if="leaderboard.provisional">
+                    当前为<b>临时结果</b>：仅按此刻已录入成绩实时计算，<b>不是正式成绩</b>，成绩补录 / 修改后会随时变化
+                  </span>
+                  <span v-else-if="leaderboard.frozen">
+                    正式排名已于 {{ leaderboard.generatedAt }} 收口冻结，之后任何补录 / 修改 / 删除成绩都不再改变名次
+                  </span>
+                  <span v-else-if="leaderboard.legacy">
+                    历史兼容口径：该赛事在本次修复前已结束、未生成正式快照，以下按旧成绩只读还原，仅用于历史查询
+                  </span>
+                  <span v-if="leaderboard.snapshotVersion != null" class="muted">
+                    （赛事 v{{ leaderboard.tournamentVersion }} / 快照 v{{ leaderboard.snapshotVersion }}）
+                  </span>
+                </div>
               </template>
-            </el-table-column>
-          </el-table>
+              <template v-if="leaderboard.kind === '生成失败'" #default>
+                <div class="lb-fail-desc">
+                  赛事「{{ leaderboard.tournamentName }}」收口失败，未产生正式结果，赛事仍是「{{ leaderboard.tournamentStatus }}」，
+                  下方临时排名仍可查询；修复以下问题后可重新收口：
+                </div>
+              </template>
+            </el-alert>
+
+            <!-- 收口失败原因：精确到赛事 / 球员 / 洞号 -->
+            <div v-if="leaderboard.failureReasons && leaderboard.failureReasons.length" class="lb-fail-box">
+              <div class="lb-fail-head">正式排行榜生成失败原因（{{ leaderboard.failureReasons.length }} 条）：</div>
+              <ul>
+                <li v-for="(r, i) in leaderboard.failureReasons" :key="i">{{ r }}</li>
+              </ul>
+            </div>
+
+            <!-- 临时结果下的非阻断提示（缺洞 / 越界 / 孤儿成绩等） -->
+            <el-alert v-if="leaderboard.provisional && leaderboard.notices && leaderboard.notices.length"
+                      type="warning" :closable="false" class="lb-banner">
+              <template #title>临时排名提示（共 {{ leaderboard.notices.length }} 条，收口前须处理）</template>
+              <ul class="lb-notice-list">
+                <li v-for="(n, i) in leaderboard.notices" :key="i">{{ n }}</li>
+              </ul>
+            </el-alert>
+
+            <!-- 名次表 -->
+            <el-table :data="leaderboard.rows" border stripe class="lb-table">
+              <el-table-column label="名次" width="80">
+                <template #default="{ row }">
+                  <el-tag v-if="row.rank != null" :type="row.rank === 1 ? 'success' : 'primary'">{{ row.rank }}</el-tag>
+                  <span v-else class="muted">未完赛</span>
+                </template>
+              </el-table-column>
+              <el-table-column prop="playerName" label="球员" min-width="120" />
+              <el-table-column label="总杆" width="90">
+                <template #default="{ row }">{{ row.totalStrokes ?? '—' }}</template>
+              </el-table-column>
+              <el-table-column label="标准杆" prop="totalPar" width="90" />
+              <el-table-column label="相对标准杆" width="110">
+                <template #default="{ row }">
+                  <el-tag v-if="row.toPar != null"
+                          :type="row.toPar > 0 ? 'danger' : row.toPar < 0 ? 'success' : 'info'">{{ toParRowText(row) }}</el-tag>
+                  <span v-else>—</span>
+                </template>
+              </el-table-column>
+              <el-table-column label="各轮 / 逐洞杆数" min-width="260">
+                <template #default="{ row }">
+                  <div v-for="rnd in row.rounds" :key="rnd.roundNo" class="lb-round">
+                    <el-tag size="small" :type="rnd.complete ? '' : 'warning'">第{{ rnd.roundNo }}轮</el-tag>
+                    <span class="lb-holes">
+                      <template v-if="leaderboard.holeNos && leaderboard.holeNos.length">
+                        <el-tag
+                          v-for="h in leaderboard.holeNos" :key="h" size="small"
+                          :type="rnd.strokesByHole[h] == null ? 'danger' : 'info'"
+                          class="lb-hole">
+                          {{ h }}洞:{{ rnd.strokesByHole[h] == null ? '缺' : rnd.strokesByHole[h] }}
+                        </el-tag>
+                      </template>
+                      <span v-else class="muted">无开放洞</span>
+                    </span>
+                    <span class="muted">小计：{{ rnd.totalStrokes ?? '—' }}</span>
+                  </div>
+                </template>
+              </el-table-column>
+            </el-table>
+          </template>
+          <el-empty v-else description="暂无排行榜数据" />
         </div>
       </el-tab-pane>
 
@@ -246,7 +378,11 @@ onMounted(loadAll)
               <el-option v-for="t in tournaments" :key="t.id" :label="t.name" :value="t.id" />
             </el-select>
             <span class="spacer"></span>
-            <el-button type="primary" @click="openScore">录入成绩</el-button>
+            <el-tag v-if="selectedTour && selectedTour.status === '已结束'" type="danger" effect="plain">
+              赛事已收口冻结，补录 / 修改成绩会被拒绝
+            </el-tag>
+            <el-button type="primary" :disabled="!!selectedTour && selectedTour.status === '已结束'"
+                       @click="openScore">录入成绩</el-button>
           </div>
           <el-table :data="scores" border stripe>
             <el-table-column prop="holeNo" label="洞号" width="90" />
@@ -306,20 +442,6 @@ onMounted(loadAll)
       </template>
     </el-dialog>
 
-    <!-- 新增排行榜 -->
-    <el-dialog v-model="lbDialog" title="新增排行榜" width="560px">
-      <el-form :model="lbForm" label-width="110px" class="dialog-form">
-        <el-form-item label="赛事"><el-input :model-value="tournaments.find(t => t.id === lbForm.tournamentId)?.name" disabled /></el-form-item>
-        <el-form-item label="轮次"><el-input v-model="lbForm.roundNo" type="number" min="1" /></el-form-item>
-        <el-form-item label="领先球员"><el-input v-model="lbForm.leaderName" /></el-form-item>
-        <el-form-item label="总杆"><el-input v-model="lbForm.totalScore" type="number" /></el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="lbDialog = false">取消</el-button>
-        <el-button type="primary" :loading="savingLb" @click="saveLb">新增</el-button>
-      </template>
-    </el-dialog>
-
     <!-- 录入成绩 -->
     <el-dialog v-model="scoreDialog" title="录入成绩" width="560px">
       <el-form :model="scoreForm" label-width="110px" class="dialog-form">
@@ -343,3 +465,24 @@ onMounted(loadAll)
     </el-dialog>
   </div>
 </template>
+
+<style scoped>
+.lb-banner { margin-bottom: 10px; }
+.lb-banner-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.lb-fail-desc { margin-top: 4px; font-size: 12px; }
+.lb-fail-box {
+  border: 1px solid var(--el-color-danger);
+  background: var(--el-color-danger-light-9);
+  border-radius: 6px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+}
+.lb-fail-head { font-weight: 700; color: var(--el-color-danger); margin-bottom: 6px; }
+.lb-fail-box ul,
+.lb-notice-list { margin: 0; padding-left: 18px; font-size: 12px; }
+.lb-fail-box li { line-height: 1.8; }
+.lb-table { margin-top: 4px; }
+.lb-round { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 2px 0; }
+.lb-holes { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+.lb-hole { font-variant-numeric: tabular-nums; }
+</style>

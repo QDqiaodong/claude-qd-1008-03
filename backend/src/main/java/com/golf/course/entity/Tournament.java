@@ -10,6 +10,7 @@ import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import jakarta.persistence.Version;
 
 import lombok.Getter;
 import lombok.Setter;
@@ -66,4 +67,12 @@ public class Tournament {
 
     @Column(name = "created_at")
     private LocalDateTime createdAt;
+
+    /**
+     * 乐观锁版本号：多人同时把赛事推进到「已结束」（生成正式排行榜快照）时，
+     * 只有基于最新版本的一次提交成功，过期操作统一转 409 并提示重新读取当前状态。
+     */
+    @Version
+    @Column(name = "version", nullable = false)
+    private Long version;
 }

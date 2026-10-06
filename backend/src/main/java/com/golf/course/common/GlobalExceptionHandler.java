@@ -3,6 +3,7 @@ package com.golf.course.common;
 import java.util.stream.Collectors;
 
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.CannotAcquireLockException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -38,7 +39,17 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(ObjectOptimisticLockingFailureException.class)
     public ResponseEntity<ApiResponse<Void>> handleOptimisticLock(ObjectOptimisticLockingFailureException e) {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiResponse.fail(
-                "记分卡已被他人先一步操作，你的页面版本已过期，本次操作未生效；请刷新页面查看当前状态后再试"));
+                "赛事数据已变化：他人已先一步推进收口 / 改动成绩，你的页面版本已过期，本次操作未生效；请重新读取当前排行榜与赛事状态后再试"));
+    }
+
+    /**
+     * 悲观行锁争用兜底：两人同时推进赛事收口、或收口与补录成绩并发时，
+     * 后到者在赛事行锁上等待超时——只有一个版本能成为正式快照，其余一律 409 并要求重读。
+     */
+    @ExceptionHandler(CannotAcquireLockException.class)
+    public ResponseEntity<ApiResponse<Void>> handleLockContention(CannotAcquireLockException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiResponse.fail(
+                "赛事正被他人推进收口或录入成绩，当前状态已变化，本次操作未生效；请重新读取排行榜与赛事状态后再试"));
     }
 
     /**

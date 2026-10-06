@@ -45,10 +45,21 @@ GET /api/scorecards/4/events
 GET /api/scorecards/official?tournamentId=1
 -- 仅含 status=已签核 的卡；卡3、卡4 签核后出现，各只计一次（当前快照）
 
--- ===== G. 赛事收口闸门 =====
--- 赛事1 有 4 名参赛球员：林浩(卡2 草稿) 等仍未签核时：
+-- ===== G. 赛事收口闸门（排行榜快照一致性） =====
+-- 收口 = 推进到「已结束」：在同一事务内校验全部参赛成绩 → 冻结唯一正式排行榜快照 → 翻状态。
+-- 任一成绩缺失 / 属于不存在或非参赛球员 / 洞号杆数不合法，整体回滚（赛事仍「进行中」、无半份正式结果），
+-- 失败原因精确到「赛事 / 球员 / 洞号」并以「生成失败」留痕。
+GET /api/tournaments/1/leaderboard
+-- 报名中 / 进行中：kind=临时结果（provisional=true），未完赛球员无名次，notices 列出缺洞等收口前问题
 GET /api/scorecards/signoff-check?tournamentId=1
 -- canClose=false，blockingReasons 逐条列出（草稿/待确认/争议/缺卡）
 POST /api/tournaments/1/advance?target=已结束
--- 400：「赛事不能收口：仍有 N 条未签核记录——…」
--- 把所有参赛球员每轮卡都签核后 → canClose=true，推进成功。
+-- 400：「赛事收口排行榜生成失败：赛事「…」球员「…」第 N 轮缺少第 X、Y 洞成绩；…」
+-- 失败后再读排行榜：kind=生成失败，failureReasons 同列表，临时排名仍可查询。
+-- 把所有参赛球员每轮成绩补齐确认后重新收口 → 200，返回 kind=正式快照（frozen=true）；
+GET /api/tournaments/1/leaderboard
+-- 永远原样返回冻结 JSON：此后成绩补录（POST /api/scores 对已结束赛事 400）/ 删除 / 修改都不再改变名次。
+-- 并发收口：双方带同一 expectedVersion 时只有一方成功，过期方 409「数据已变化，请重新读取当前状态」。
+POST /api/tournaments/1/leaderboard/finalize?expectedVersion=0
+-- 修复前已结束、无正式快照的旧赛事：kind=历史口径（legacy=true，只读），旧赛事与旧成绩不丢失。
+

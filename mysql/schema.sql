@@ -25,6 +25,7 @@ DROP TABLE IF EXISTS scorecard_hole;
 DROP TABLE IF EXISTS scorecard;
 DROP TABLE IF EXISTS tournament_entry;
 DROP TABLE IF EXISTS score;
+DROP TABLE IF EXISTS leaderboard_snapshot;
 DROP TABLE IF EXISTS leaderboard;
 DROP TABLE IF EXISTS tee_time;
 DROP TABLE IF EXISTS tournament;
@@ -89,6 +90,8 @@ CREATE TABLE tournament (
     slope_rating INT,
     note VARCHAR(64),
     created_at DATETIME,
+    -- 赛事乐观锁版本号：多人并发推进收口（生成正式快照）时，只有基于最新版本的一次成功。
+    version BIGINT NOT NULL DEFAULT 0,
     KEY idx_tour_end_date (end_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -102,6 +105,29 @@ CREATE TABLE leaderboard (
     total_score INT,
     version BIGINT,
     updated_at DATETIME
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ---------------- 赛事排行榜快照（临时结果 / 正式快照 / 收口失败原因） ----------------
+-- 一场赛事至多一行（uk_snapshot_tournament 兜底，并发收口只允许一份正式快照）。
+-- snapshot_type：
+--   临时结果 = 报名中 / 进行中按当前已录入成绩实时计算的口径，只在接口 / 页面返回并明确标注，不落库；
+--   正式快照 = 收口成功瞬间冻结的全部参赛成绩与名次，之后刷新页面 / 接口永远只返回这份 JSON，
+--              成绩的补录 / 修改 / 删除不再改变名次；
+--   生成失败 = 收口校验未过（缺成绩 / 成绩属于不存在或非参赛球员 / 洞号杆数不合法），
+--              事务回滚、赛事保持「进行中」、不留下半份正式结果；失败原因逐条存 failure_reasons。
+-- official_payload_json：正式快照冻结体（完整名次行 + 每轮逐洞杆数），历史数据兼容用，永不修改。
+-- version 为乐观锁版本号；generated_at 为正式快照生成（或上次收口失败）时间。
+CREATE TABLE leaderboard_snapshot (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    tournament_id BIGINT NOT NULL,
+    snapshot_type VARCHAR(16) NOT NULL,
+    status_snapshot VARCHAR(16),
+    failure_reasons TEXT,
+    official_payload_json MEDIUMTEXT,
+    generated_at DATETIME,
+    version BIGINT NOT NULL DEFAULT 0,
+    updated_at DATETIME,
+    UNIQUE KEY uk_snapshot_tournament (tournament_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------- 成绩（按洞录入） ----------------
