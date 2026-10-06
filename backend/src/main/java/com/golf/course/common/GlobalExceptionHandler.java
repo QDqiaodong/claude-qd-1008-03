@@ -38,7 +38,7 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(ObjectOptimisticLockingFailureException.class)
     public ResponseEntity<ApiResponse<Void>> handleOptimisticLock(ObjectOptimisticLockingFailureException e) {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiResponse.fail(
-                "记分卡已被他人先一步操作，你的页面版本已过期，本次操作未生效；请刷新页面查看当前状态后再试"));
+                "数据已被他人先一步修改，你的页面版本已过期，本次操作未生效；请刷新页面查看当前状态后再试"));
     }
 
     /**

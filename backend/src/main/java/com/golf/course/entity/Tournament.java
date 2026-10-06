@@ -10,6 +10,7 @@ import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import jakarta.persistence.Version;
 
 import lombok.Getter;
 import lombok.Setter;
@@ -22,6 +23,10 @@ import lombok.Setter;
  * <p>courseRating / slopeRating 为该赛事所用球场的难度参数（差点差值计算的输入），
  * 需成对维护；旧赛事允许为 NULL，涉及轮次在差点计算中会被标记「缺球场难度参数」并排除，
  * 补齐参数后可对受影响球员做定向重算。</p>
+ *
+ * <p>{@code version} 为 JPA {@link Version} 乐观锁：多人并发推进/收口同一赛事时，
+ * 只有基于最新版本的一次操作能提交，过期操作转 409「数据已变化」，
+ * 保证「已结束」收口与正式排行榜快照生成只会成功一次。</p>
  */
 @Entity
 @Table(name = "tournament")
@@ -63,6 +68,11 @@ public class Tournament {
 
     @Column(name = "note", length = 64)
     private String note;
+
+    /** 乐观锁版本号：并发推进/收口时只有基于最新版本的一次操作成功 */
+    @Version
+    @Column(name = "version", nullable = false)
+    private Long version;
 
     @Column(name = "created_at")
     private LocalDateTime createdAt;

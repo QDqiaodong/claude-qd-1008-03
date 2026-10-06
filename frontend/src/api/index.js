@@ -51,9 +51,16 @@ export default {
   getTournament: (id) => call(http.get(`/tournaments/${id}`)),
   createTournament: (d) => call(http.post('/tournaments', d)),
   updateTournament: (id, d) => call(http.put(`/tournaments/${id}`, d)),
-  advanceTournament: (id, target) => call(http.post(`/tournaments/${id}/advance`, null, params({ target }))),
+  advanceTournament: (id, target, expectedVersion) =>
+    call(http.post(`/tournaments/${id}/advance`, null,
+      params(expectedVersion == null ? { target } : { target, expectedVersion }))),
 
-  // ---------------- 排行榜（乐观锁演示） ----------------
+  // ---------------- 赛事排行榜快照（临时排名 / 正式快照 / 生成失败原因） ----------------
+  leaderboardView: (tournamentId) => call(http.get(`/tournaments/${tournamentId}/leaderboard`)),
+  generateLeaderboardSnapshot: (tournamentId) =>
+    call(http.post(`/tournaments/${tournamentId}/leaderboard/generate`)),
+
+  // ---------------- 旧版手工排行榜（历史数据兼容：仅查询/演示乐观锁，新页面不再写入） ----------------
   listLeaderboards: (p) => call(http.get('/leaderboards', params(p || {}))),
   getLeaderboard: (id) => call(http.get(`/leaderboards/${id}`)),
   createLeaderboard: (d) => call(http.post('/leaderboards', d)),

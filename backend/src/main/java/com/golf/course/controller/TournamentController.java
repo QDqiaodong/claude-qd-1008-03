@@ -46,9 +46,14 @@ public class TournamentController {
         return ApiResponse.success("赛事已更新", tournamentService.update(id, input));
     }
 
-    /** 状态推进：报名中 → 进行中 → 已结束 */
+    /**
+     * 状态推进：报名中 → 进行中 → 已结束。
+     * expectedVersion 为页面加载时看到的赛事版本号（可空）：多人同时推进同一赛事时，
+     * 只有基于最新版本的一次操作成功，过期操作返回 409「数据已变化」。
+     */
     @PostMapping("/{id}/advance")
-    public ApiResponse<Tournament> advance(@PathVariable Long id, @RequestParam String target) {
-        return ApiResponse.success("赛事状态已推进", tournamentService.advance(id, target));
+    public ApiResponse<Tournament> advance(@PathVariable Long id, @RequestParam String target,
+                                           @RequestParam(required = false) Long expectedVersion) {
+        return ApiResponse.success("赛事状态已推进", tournamentService.advance(id, target, expectedVersion));
     }
 }

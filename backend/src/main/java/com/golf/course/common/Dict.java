@@ -35,6 +35,14 @@ public final class Dict {
     /** 单洞最少杆数（一杆起） */
     public static final int MIN_STROKES = 1;
 
+    // ---------------- 赛事排行榜快照 ----------------
+    /** 排行榜视图类型：临时（报名中/进行中现算，或历史赛事未生成快照） */
+    public static final String LEADERBOARD_PROVISIONAL = "临时";
+    /** 排行榜视图类型 / 快照状态：正式（收口时生成的唯一冻结快照） */
+    public static final String SNAPSHOT_OFFICIAL = "正式";
+    /** 快照状态：生成失败（收口校验未过，原因落 fail_reason，临时排名仍可查） */
+    public static final String SNAPSHOT_FAILED = "生成失败";
+
     // ---------------- 记分卡签核闭环 ----------------
     /** 记分卡状态：草稿 → 待球员确认 → 争议中 →（回到待球员确认）→ 已签核 */
     public static final String CARD_DRAFT = "草稿";

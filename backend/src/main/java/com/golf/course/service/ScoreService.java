@@ -22,6 +22,11 @@ import com.golf.course.repository.TournamentRepository;
  *
  * <p>核心规则：① 球员 / 赛事 / 球洞必须存在；② 单洞杆数须 ≥ 1；③ 录入后可通过
  * {@code toPar}（杆数 - par）查看相对标准杆的成绩。</p>
+ *
+ * <p>收口边界：赛事「已结束」后正式排行榜快照已冻结，成绩一律不得再补录
+ * （读取接口只认快照，但这里仍显式拒绝，避免库里出现收口后的游离成绩）。
+ * 录入与「推进到已结束」共用赛事行悲观写锁：要么本录入先入库、被收口校验看见，
+ * 要么收口先生效、本录入看到「已结束」被拒——不会漏进快照生成后的空窗。</p>
  */
 @Service
 public class ScoreService {
@@ -52,7 +57,11 @@ public class ScoreService {
     @Transactional
     public Score record(Score input) {
         Player player = resolvePlayer(input.getPlayer());
-        Tournament tournament = resolveTournament(input.getTournament());
+        Tournament tournament = resolveTournamentForUpdate(input.getTournament());
+        if ("已结束".equals(tournament.getStatus())) {
+            throw new BizException("赛事「" + tournament.getName()
+                    + "」已结束，正式排行榜快照已生成，成绩不能再补录或修改");
+        }
         Hole hole = resolveHole(input.getHole());
         if (input.getRoundNo() == null || input.getRoundNo() < 1) {
             throw new BizException("轮次必须大于 0");
@@ -78,11 +87,15 @@ public class ScoreService {
                 .orElseThrow(() -> new BizException("球员不存在：" + p.getId()));
     }
 
-    private Tournament resolveTournament(Tournament t) {
+    /**
+     * 以悲观写锁读取赛事：与「推进到已结束」串行化——要么本事务先录入（被收口校验看见），
+     * 要么收口先提交（本事务读到「已结束」被拒），保证正式快照的数据边界。
+     */
+    private Tournament resolveTournamentForUpdate(Tournament t) {
         if (t == null || t.getId() == null) {
             throw new BizException("必须指定赛事");
         }
-        return tournamentRepository.findById(t.getId())
+        return tournamentRepository.findByIdForUpdate(t.getId())
                 .orElseThrow(() -> new BizException("赛事不存在：" + t.getId()));
     }
 

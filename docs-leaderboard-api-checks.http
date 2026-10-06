@@ -1,0 +1,86 @@
+-- 赛事排行榜快照一致性 · 端到端手工验证脚本（按顺序执行；HTTP 状态码与消息均有断言点）
+-- 前置：./start.sh 起服务；赛事 1「金秋会员邀请赛」已推进到「进行中」，
+--       且 4 名参赛球员（林浩/陈雨桐/王启明/刘振华）的记分卡全部签核
+--       （签核闭环走法见 docs-scorecard-api-checks.http）。
+-- 此时赛事 1 version=1（创建时 0 → 推进到进行中时 1）。
+
+-- ===== A. 临时排名：报名中/进行中只展示当前已录入成绩，明确标注临时 =====
+GET /api/tournaments/1/leaderboard
+-- 预期 200：type=临时，version=null，rows 按 score 表现算
+--   （林浩 3 洞 13 杆、王启明 3 洞 11 杆、刘振华 2 洞 9 杆，名次按总杆升序）
+
+-- 成绩变化后临时排名即时变化（不产生任何正式结果）：
+POST /api/scores  {"player":{"id":5},"tournament":{"id":1},"hole":{"id":3},"roundNo":1,"strokes":2}
+GET /api/tournaments/1/leaderboard
+-- 预期：刘振华变为 3 洞 11 杆，名次重排，type 仍为临时
+
+-- ===== B. 收口校验失败：缺成绩 → 400，指出具体赛事/球员/洞号；不留半份正式结果 =====
+POST /api/tournaments/1/advance?target=已结束&expectedVersion=1
+-- 预期 400：「赛事『金秋会员邀请赛』正式排行榜快照生成失败：
+--   球员『林浩』第 1 轮缺少成绩：第 4、6、7、8 洞；
+--   球员『陈雨桐』第 1 轮缺少成绩：第 1、2、3、4、6、7、8 洞；…」
+GET /api/tournaments/1
+-- 预期：status 仍是「进行中」（整体回滚，没有半截收口）
+GET /api/tournaments/1/leaderboard
+-- 预期：type=临时（临时排名仍可查），failReason 为上面的失败原因（已落库，刷新仍在）
+
+-- ===== C. 补齐全部参赛成绩后收口 → 唯一正式快照 =====
+-- 4 名参赛球员 × 7 个开放洞（1/2/3/4/6/7/8），按缺口补齐：
+POST /api/scores  {"player":{"id":1},"tournament":{"id":1},"hole":{"id":4},"roundNo":1,"strokes":4}
+POST /api/scores  {"player":{"id":1},"tournament":{"id":1},"hole":{"id":6},"roundNo":1,"strokes":3}
+POST /api/scores  {"player":{"id":1},"tournament":{"id":1},"hole":{"id":7},"roundNo":1,"strokes":5}
+POST /api/scores  {"player":{"id":1},"tournament":{"id":1},"hole":{"id":8},"roundNo":1,"strokes":4}
+POST /api/scores  {"player":{"id":2},"tournament":{"id":1},"hole":{"id":1},"roundNo":1,"strokes":5}
+POST /api/scores  {"player":{"id":2},"tournament":{"id":1},"hole":{"id":2},"roundNo":1,"strokes":6}
+POST /api/scores  {"player":{"id":2},"tournament":{"id":1},"hole":{"id":3},"roundNo":1,"strokes":3}
+POST /api/scores  {"player":{"id":2},"tournament":{"id":1},"hole":{"id":4},"roundNo":1,"strokes":5}
+POST /api/scores  {"player":{"id":2},"tournament":{"id":1},"hole":{"id":6},"roundNo":1,"strokes":4}
+POST /api/scores  {"player":{"id":2},"tournament":{"id":1},"hole":{"id":7},"roundNo":1,"strokes":5}
+POST /api/scores  {"player":{"id":2},"tournament":{"id":1},"hole":{"id":8},"roundNo":1,"strokes":5}
+POST /api/scores  {"player":{"id":3},"tournament":{"id":1},"hole":{"id":4},"roundNo":1,"strokes":4}
+POST /api/scores  {"player":{"id":3},"tournament":{"id":1},"hole":{"id":6},"roundNo":1,"strokes":3}
+POST /api/scores  {"player":{"id":3},"tournament":{"id":1},"hole":{"id":7},"roundNo":1,"strokes":6}
+POST /api/scores  {"player":{"id":3},"tournament":{"id":1},"hole":{"id":8},"roundNo":1,"strokes":4}
+POST /api/scores  {"player":{"id":5},"tournament":{"id":1},"hole":{"id":4},"roundNo":1,"strokes":4}
+POST /api/scores  {"player":{"id":5},"tournament":{"id":1},"hole":{"id":6},"roundNo":1,"strokes":3}
+POST /api/scores  {"player":{"id":5},"tournament":{"id":1},"hole":{"id":7},"roundNo":1,"strokes":5}
+POST /api/scores  {"player":{"id":5},"tournament":{"id":1},"hole":{"id":8},"roundNo":1,"strokes":6}
+
+POST /api/tournaments/1/advance?target=已结束&expectedVersion=1
+-- 预期 200：赛事已结束，正式快照同一事务生成（赛事 version 1→2）
+GET /api/tournaments/1/leaderboard
+-- 预期：type=正式，version=0，generatedAt/scoreRows(=28) 有值，
+--   rows 冻结（含名次、逐洞明细、总杆、相对标准杆）
+
+-- ===== D. 快照免疫：之后成绩补录/修改/删除都不再改变名次 =====
+POST /api/scores  {"player":{"id":1},"tournament":{"id":1},"hole":{"id":9},"roundNo":1,"strokes":3}
+-- 预期 400：「赛事『金秋会员邀请赛』已结束，正式排行榜快照已生成，成绩不能再补录或修改」
+-- （即便直接改库动 score 表，读取接口也只返回快照：）
+GET /api/tournaments/1/leaderboard
+-- 预期：与 C 最后一次读取逐字节一致（名次不变）
+
+-- ===== E. 并发与过期操作：只允许一个版本成为正式快照 =====
+POST /api/tournaments/1/advance?target=已结束&expectedVersion=1
+-- 预期 409：「赛事数据已变化：你基于 v1 的页面操作，当前已是 v2（状态：已结束）…请刷新」
+POST /api/tournaments/1/leaderboard/generate
+-- 预期 409：「正式排行榜快照已存在（v0），不能重复生成；请刷新查看当前状态」
+-- 两人同时推进同一赛事（都带 expectedVersion=1）：一个 200，另一个 409。
+
+-- ===== F. 历史已结束赛事兼容：数据不消失，可补生成，失败原因可查 =====
+GET /api/tournaments/3/leaderboard
+-- 预期：type=临时，rows=[]（旧赛事无 score 行，但赛事/记分卡/旧成绩均在）
+POST /api/tournaments/3/leaderboard/generate
+-- 预期 400：「…缺少成绩：第 1、2、3、4、6、7、8 洞」（逐球员列出）
+GET /api/tournaments/3/leaderboard
+-- 预期：type=临时 + failReason（失败原因落库）；不产生任何正式快照行内容
+GET /api/leaderboards?tournamentId=1
+-- 预期：旧版手工排行榜演示数据仍在（历史数据兼容，接口保留）
+
+-- ===== G. 脏数据校验（直接写库制造，验证三类收口失败） =====
+-- 成绩属于不存在的球员：
+--   docker compose exec mysql mysql -uadmin -ppassword golf_course -e \
+--     "INSERT INTO score(player_id,tournament_id,hole_id,round_no,strokes,created_at) VALUES (999,2,1,1,3,NOW());"
+--   对赛事 2 收口（需先完成其签核闭环）→ 400 含「成绩记录 #N 属于不存在的球员（ID=999），第 1 轮，第 1 洞」
+-- 杆数不合法：
+--   同上插入 strokes=0 → 400 含「…第 1 洞杆数不合法（0，须 ≥ 1）」
+-- 重复成绩：同一球员同一轮次同一洞两行 → 400 含「存在 2 条重复成绩，须先去重」

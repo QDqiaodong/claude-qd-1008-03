@@ -289,14 +289,24 @@ async function closeTournament() {
     return ElMessage.error(`仍有 ${check.blockingReasons.length} 条未签核记录，已列在下方，不能收口`)
   }
   try {
-    await ElMessageBox.confirm('全部参赛球员记分卡均已签核，确认把赛事推进到「已结束」？',
+    await ElMessageBox.confirm('全部参赛球员记分卡均已签核，确认把赛事推进到「已结束」？收口将生成唯一正式排行榜快照并冻结名次。',
       '赛事收口', { type: 'warning', confirmButtonText: '确认收口', cancelButtonText: '取消' })
   } catch { return }
   try {
-    await api.advanceTournament(selectedTourId.value, '已结束')
-    ElMessage.success('赛事已结束')
-    await loadBase()
-  } catch (e) { ElMessage.error(e.message) }
+    // 携带页面看到的赛事版本号：多人同时收口时，过期操作会收到 409「数据已变化」
+    await api.advanceTournament(selectedTourId.value, '已结束', selectedTournament.value?.version)
+    ElMessage.success('赛事已结束，正式排行榜快照已生成并冻结')
+  } catch (e) {
+    if (e.isConflict) {
+      ElMessage({ type: 'error', duration: 6000, message: `数据已变化：${e.message}` })
+    } else {
+      // 收口校验失败（如排行榜缺成绩）：原因已落库，刷新后在赛事页排行榜可见
+      ElMessage({ type: 'error', duration: 8000, message: e.message })
+    }
+  }
+  // 无论成败都重新读取当前状态（状态变化后自动刷新对应内容）
+  await loadBase()
+  await onTourChange()
 }
 
 const toParText = (n) => n == null ? '-' : (n === 0 ? 'E' : (n > 0 ? `+${n}` : `${n}`))

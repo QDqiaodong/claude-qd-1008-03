@@ -6,11 +6,12 @@ const tournaments = ref([])
 const players = ref([])
 const holes = ref([])
 
-const leaderboards = ref([])
+const leaderboard = ref(null)
 const scores = ref([])
 const error = ref('')
 const tip = ref('')
 const loading = ref(false)
+const generating = ref(false)
 
 const selectedTourId = ref(null)
 const activeTab = ref('tournament')
@@ -49,14 +50,6 @@ async function saveEdit() {
   } catch (e) { error.value = e.message } finally { savingEdit.value = false }
 }
 
-// ---- 排行榜 ----
-const lbDialog = ref(false)
-const savingLb = ref(false)
-const lbForm = ref(blankLb())
-function blankLb() {
-  return { tournamentId: null, roundNo: 1, leaderName: '', totalScore: null }
-}
-
 // ---- 成绩 ----
 const scoreDialog = ref(false)
 const savingScore = ref(false)
@@ -68,15 +61,21 @@ function blankScore() {
 const canStart = (t) => t && t.status === '报名中'
 const canEnd = (t) => t && t.status === '进行中'
 
+const selectedTournament = computed(() => tournaments.value.find(t => t.id === selectedTourId.value))
+const isEnded = computed(() => selectedTournament.value?.status === '已结束')
+// 历史已结束赛事还没有正式快照时，允许补生成（与收口共用同一份校验）
+const canGenerateSnapshot = computed(() =>
+  isEnded.value && leaderboard.value && leaderboard.value.type === '临时')
+
 async function loadTournaments() {
   tournaments.value = (await api.listTournaments()) || []
   if (!selectedTourId.value && tournaments.value.length) {
     selectedTourId.value = tournaments.value[0].id
   }
 }
-async function loadLeaderboards() {
-  if (!selectedTourId.value) { leaderboards.value = []; return }
-  leaderboards.value = (await api.listLeaderboards({ tournamentId: selectedTourId.value })) || []
+async function loadLeaderboard() {
+  if (!selectedTourId.value) { leaderboard.value = null; return }
+  leaderboard.value = await api.leaderboardView(selectedTourId.value)
 }
 async function loadScores() {
   if (!selectedTourId.value) { scores.value = []; return }
@@ -85,7 +84,7 @@ async function loadScores() {
 
 async function loadAll() {
   await Promise.all([loadTournaments(), loadPlayers(), loadHoles()])
-  await Promise.all([loadLeaderboards(), loadScores()])
+  await Promise.all([loadLeaderboard(), loadScores()])
 }
 async function loadPlayers() { players.value = (await api.listPlayers()) || [] }
 async function loadHoles() { holes.value = (await api.listHoles()) || [] }
@@ -104,33 +103,41 @@ async function saveTour() {
     tourDialog.value = false; await loadTournaments()
   } catch (e) { error.value = e.message } finally { savingTour.value = false }
 }
+
+// 状态推进携带页面看到的版本号：多人同时推进同一赛事时，过期操作会收到 409「数据已变化」
 async function advance(t, target) {
   error.value = ''; tip.value = ''
-  try { await api.advanceTournament(t.id, target); tip.value = `赛事已推进至「${target}」`; await loadTournaments() }
-  catch (e) { error.value = e.message }
+  try {
+    await api.advanceTournament(t.id, target, t.version)
+    tip.value = target === '已结束'
+      ? '赛事已推进至「已结束」，正式排行榜快照已生成并冻结'
+      : `赛事已推进至「${target}」`
+  } catch (e) {
+    error.value = e.isConflict ? `数据已变化：${e.message}` : e.message
+  }
+  // 无论成败都重新读取当前状态：成功要刷新榜单与成绩；
+  // 收口校验失败时，失败原因已落库，重新读取才能展示在排行榜页
+  await loadTournaments()
+  await Promise.all([loadLeaderboard(), loadScores()])
 }
 
-function openLb() {
-  lbForm.value = blankLb(); lbForm.value.tournamentId = selectedTourId.value
-  lbDialog.value = true; error.value = ''; tip.value = ''
-}
-async function saveLb() {
-  savingLb.value = true; error.value = ''
+// 历史已结束赛事补生成正式快照
+async function generateSnapshot() {
+  generating.value = true; error.value = ''; tip.value = ''
   try {
-    await api.createLeaderboard({ ...lbForm.value, roundNo: Number(lbForm.value.roundNo), totalScore: Number(lbForm.value.totalScore) })
-    tip.value = '排行榜已创建'; lbDialog.value = false; await loadLeaderboards()
-  } catch (e) { error.value = e.message } finally { savingLb.value = false }
-}
-async function lockAndRead(lb) {
-  error.value = ''; tip.value = ''
-  try {
-    const updated = await api.lockAndReadLeaderboard(lb.id)
-    tip.value = `已锁定并读取：版本号由 ${lb.version} → ${updated.version}（OPTIMISTIC_FORCE_INCREMENT）`
-    await loadLeaderboards()
-  } catch (e) { error.value = e.message }
+    leaderboard.value = await api.generateLeaderboardSnapshot(selectedTourId.value)
+    tip.value = '正式排行榜快照已生成并冻结，之后成绩补录/修改/删除不再影响名次'
+  } catch (e) {
+    error.value = e.isConflict ? `数据已变化：${e.message}` : e.message
+    await loadLeaderboard().catch(() => {})
+  } finally { generating.value = false }
 }
 
 function openScore() {
+  if (isEnded.value) {
+    error.value = '赛事已结束，正式排行榜快照已生成，成绩不能再补录或修改'
+    return
+  }
   scoreForm.value = blankScore(); scoreForm.value.tournamentId = selectedTourId.value
   scoreDialog.value = true; error.value = ''; tip.value = ''
 }
@@ -144,14 +151,16 @@ async function saveScore() {
       roundNo: Number(scoreForm.value.roundNo),
       strokes: Number(scoreForm.value.strokes)
     })
-    tip.value = '成绩已录入（相对标准杆见 toPar 列）'
-    scoreDialog.value = false; await loadScores()
+    tip.value = '成绩已录入（临时排名已同步刷新；赛事收口后将以正式快照为准）'
+    scoreDialog.value = false
+    // 成绩变化会改变临时排名：同步刷新成绩列表与排行榜
+    await Promise.all([loadScores(), loadLeaderboard()])
   } catch (e) { error.value = e.message } finally { savingScore.value = false }
 }
 
-const toParText = (s) => s.toPar == null ? '-' : (s.toPar === 0 ? 'E' : (s.toPar > 0 ? '+' + s.toPar : s.toPar))
+const toParText = (n) => n == null ? '-' : (n === 0 ? 'E' : (n > 0 ? `+${n}` : `${n}`))
 
-watch(selectedTourId, async () => { await Promise.all([loadLeaderboards(), loadScores()]) })
+watch(selectedTourId, async () => { await Promise.all([loadLeaderboard(), loadScores()]) })
 
 onMounted(loadAll)
 </script>
@@ -167,10 +176,10 @@ onMounted(loadAll)
         <div class="panel">
           <div class="panel-head">
             <span class="panel-title">赛事 · 报名与推进</span>
-            <span class="panel-desc">状态只能逐级推进：报名中 → 进行中 → 已结束</span>
+            <span class="panel-desc">状态只能逐级推进：报名中 → 进行中 → 已结束；推进到已结束时生成唯一正式排行榜快照</span>
           </div>
           <div class="toolbar">
-            <el-select v-model="selectedTourId" placeholder="选择赛事" style="width: 220px" @change="loadLeaderboards">
+            <el-select v-model="selectedTourId" placeholder="选择赛事" style="width: 220px">
               <el-option v-for="t in tournaments" :key="t.id" :label="`${t.name}（${t.status}）`" :value="t.id" />
             </el-select>
             <span class="spacer"></span>
@@ -204,30 +213,59 @@ onMounted(loadAll)
         </div>
       </el-tab-pane>
 
-      <!-- ============ 排行榜（乐观锁演示） ============ -->
+      <!-- ============ 排行榜（临时排名 / 正式快照） ============ -->
       <el-tab-pane label="排行榜" name="leaderboard">
         <div class="panel">
           <div class="panel-head">
-            <span class="panel-title">赛事排行榜 · 乐观锁演示</span>
-            <span class="panel-desc">「锁定并读取」用 OPTIMISTIC_FORCE_INCREMENT 强制版本号 +1，并发刷新会触发版本冲突</span>
+            <span class="panel-title">赛事排行榜 · 快照一致性</span>
+            <span class="panel-desc">
+              报名中/进行中只展示当前已录入成绩的临时排名；赛事结束时基于收口前确认的全部参赛成绩生成唯一正式快照并冻结
+            </span>
           </div>
           <div class="toolbar">
             <el-select v-model="selectedTourId" placeholder="选择赛事" style="width: 220px">
-              <el-option v-for="t in tournaments" :key="t.id" :label="t.name" :value="t.id" />
+              <el-option v-for="t in tournaments" :key="t.id" :label="`${t.name}（${t.status}）`" :value="t.id" />
             </el-select>
+            <template v-if="leaderboard">
+              <el-tag v-if="leaderboard.type === '正式'" type="success">正式快照 · v{{ leaderboard.version }}</el-tag>
+              <el-tag v-else type="warning">临时结果</el-tag>
+            </template>
             <span class="spacer"></span>
-            <el-button type="primary" @click="openLb">新增排行</el-button>
+            <el-button size="small" @click="loadLeaderboard">刷新</el-button>
+            <el-button v-if="canGenerateSnapshot" type="success" :loading="generating" @click="generateSnapshot">
+              生成正式快照
+            </el-button>
           </div>
-          <el-table :data="leaderboards" border stripe>
-            <el-table-column prop="roundNo" label="轮次" width="90" />
-            <el-table-column prop="leaderName" label="领先球员" min-width="130" />
-            <el-table-column prop="totalScore" label="总杆" width="100" />
-            <el-table-column prop="version" label="版本号" width="100">
-              <template #default="{ row }"><el-tag type="primary">{{ row.version }}</el-tag></template>
-            </el-table-column>
-            <el-table-column label="操作" width="140" fixed="right">
+
+          <el-alert v-if="leaderboard && leaderboard.type === '临时'" type="warning" :closable="false" show-icon
+            title="临时排名：赛事尚未收口，以下为当前已录入成绩的实时汇总，可能随成绩录入而变化，不能作为正式成绩"
+            style="margin-bottom: 12px" />
+          <el-alert v-else-if="leaderboard && leaderboard.type === '正式'" type="success" :closable="false" show-icon
+            :title="`正式快照：生成于 ${leaderboard.generatedAt || '-'}，共纳入 ${leaderboard.scoreRows} 条成绩；名次已冻结，之后的成绩补录/修改/删除不再影响本榜`"
+            style="margin-bottom: 12px" />
+          <el-alert v-if="leaderboard && leaderboard.failReason" type="error" :closable="false" show-icon
+            title="上次正式快照生成失败（临时排名不受影响，补齐数据后可重试）" :description="leaderboard.failReason"
+            style="margin-bottom: 12px" />
+
+          <el-table :data="leaderboard ? leaderboard.rows : []" border stripe
+            empty-text="该赛事暂无成绩记录">
+            <el-table-column label="名次" width="80">
               <template #default="{ row }">
-                <el-button size="small" type="primary" plain @click="lockAndRead(row)">锁定并读取</el-button>
+                <el-tag :type="row.rank === 1 ? 'success' : 'info'" effect="plain">{{ row.rank }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="球员" min-width="130">
+              <template #default="{ row }">{{ row.playerName || `未知球员 #${row.playerId}` }}</template>
+            </el-table-column>
+            <el-table-column prop="roundNo" label="轮次" width="80" />
+            <el-table-column prop="holes" label="已录洞数" width="90" />
+            <el-table-column prop="totalStrokes" label="总杆" width="90" />
+            <el-table-column prop="totalPar" label="标准杆" width="90" />
+            <el-table-column label="相对标准杆" width="120">
+              <template #default="{ row }">
+                <el-tag :type="row.toPar > 0 ? 'danger' : row.toPar < 0 ? 'success' : 'info'">
+                  {{ toParText(row.toPar) }}
+                </el-tag>
               </template>
             </el-table-column>
           </el-table>
@@ -239,14 +277,16 @@ onMounted(loadAll)
         <div class="panel">
           <div class="panel-head">
             <span class="panel-title">成绩 · 按洞录入</span>
-            <span class="panel-desc">单洞杆数须 ≥ 1，toPar = 杆数 − 标准杆（负为好）</span>
+            <span class="panel-desc">
+              {{ isEnded ? '赛事已结束，正式快照已冻结，成绩不能再补录或修改' : '单洞杆数须 ≥ 1，toPar = 杆数 − 标准杆（负为好）；录入后临时排名即时刷新' }}
+            </span>
           </div>
           <div class="toolbar">
             <el-select v-model="selectedTourId" placeholder="选择赛事" style="width: 220px">
               <el-option v-for="t in tournaments" :key="t.id" :label="t.name" :value="t.id" />
             </el-select>
             <span class="spacer"></span>
-            <el-button type="primary" @click="openScore">录入成绩</el-button>
+            <el-button type="primary" :disabled="isEnded" @click="openScore">录入成绩</el-button>
           </div>
           <el-table :data="scores" border stripe>
             <el-table-column prop="holeNo" label="洞号" width="90" />
@@ -256,7 +296,7 @@ onMounted(loadAll)
             <el-table-column prop="strokes" label="杆数" width="90" />
             <el-table-column label="相对标准杆" width="120">
               <template #default="{ row }">
-                <el-tag :type="row.toPar > 0 ? 'danger' : row.toPar < 0 ? 'success' : 'info'">{{ toParText(row) }}</el-tag>
+                <el-tag :type="row.toPar > 0 ? 'danger' : row.toPar < 0 ? 'success' : 'info'">{{ toParText(row.toPar) }}</el-tag>
               </template>
             </el-table-column>
           </el-table>
@@ -303,20 +343,6 @@ onMounted(loadAll)
       <template #footer>
         <el-button @click="editDialog = false">取消</el-button>
         <el-button type="primary" :loading="savingEdit" @click="saveEdit">保存</el-button>
-      </template>
-    </el-dialog>
-
-    <!-- 新增排行榜 -->
-    <el-dialog v-model="lbDialog" title="新增排行榜" width="560px">
-      <el-form :model="lbForm" label-width="110px" class="dialog-form">
-        <el-form-item label="赛事"><el-input :model-value="tournaments.find(t => t.id === lbForm.tournamentId)?.name" disabled /></el-form-item>
-        <el-form-item label="轮次"><el-input v-model="lbForm.roundNo" type="number" min="1" /></el-form-item>
-        <el-form-item label="领先球员"><el-input v-model="lbForm.leaderName" /></el-form-item>
-        <el-form-item label="总杆"><el-input v-model="lbForm.totalScore" type="number" /></el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="lbDialog = false">取消</el-button>
-        <el-button type="primary" :loading="savingLb" @click="saveLb">新增</el-button>
       </template>
     </el-dialog>
 
